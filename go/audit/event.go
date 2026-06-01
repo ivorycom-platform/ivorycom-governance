@@ -5,6 +5,7 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,20 +61,21 @@ type Params struct {
 }
 
 // NewEvent builds an AuditEvent from p, generating a UUID id and a UTC
-// EventTime. It panics if TenantID, Action, ObjectType, or Service are empty,
-// since an audit event missing any of these cannot be attributed.
-func NewEvent(p Params) AuditEvent {
+// EventTime. It returns an error naming the first missing required field if
+// TenantID, Action, ObjectType, or Service are empty, since an audit event
+// missing any of these cannot be attributed.
+func NewEvent(p Params) (AuditEvent, error) {
 	if p.TenantID == "" {
-		panic("audit: TenantID is required")
+		return AuditEvent{}, fmt.Errorf("audit: TenantID required")
 	}
 	if p.Action == "" {
-		panic("audit: Action is required")
+		return AuditEvent{}, fmt.Errorf("audit: Action required")
 	}
 	if p.ObjectType == "" {
-		panic("audit: ObjectType is required")
+		return AuditEvent{}, fmt.Errorf("audit: ObjectType required")
 	}
 	if p.Service == "" {
-		panic("audit: Service is required")
+		return AuditEvent{}, fmt.Errorf("audit: Service required")
 	}
 	return AuditEvent{
 		ID:         uuid.NewString(),
@@ -89,5 +91,16 @@ func NewEvent(p Params) AuditEvent {
 		Service:    p.Service,
 		JTI:        p.JTI,
 		EventTime:  time.Now().UTC(),
+	}, nil
+}
+
+// MustNewEvent is like NewEvent but panics if a required field is missing. It
+// is intended for callers with static, known-valid input (mirroring the
+// stdlib regexp.MustCompile convention).
+func MustNewEvent(p Params) AuditEvent {
+	ev, err := NewEvent(p)
+	if err != nil {
+		panic(err)
 	}
+	return ev
 }
