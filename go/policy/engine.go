@@ -84,13 +84,3 @@ func (e *Engine) Can(id Identity, action, objectType, field string) Decision {
 
 	return decideField(rule, action, field, grant)
 }
-
-// --- minimal field handling (extended in Task 4 / fls.go) ---
-
-func visibleAndMasked(rule PolicyRule) ([]string, map[string]string) {
-	return nil, nil
-}
-
-func decideField(rule PolicyRule, action, field string, grant bool) Decision {
-	return Decision{Allow: grant}
-}
