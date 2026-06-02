@@ -44,6 +44,14 @@ type Condition struct {
 // FLS (the key "*" is the default applied to any field without an explicit
 // entry); RecordConditions are ABAC predicates ANDed together for record-scoped
 // access.
+//
+// BUNDLE-AUTHOR WARNING (field inheritance): a field with neither an explicit
+// Fields entry nor a "*" default INHERITS the object-level action grant — i.e.
+// if the role can Read the object, it can read that field. Therefore sensitive
+// fields (SSN, salary, payment data, etc.) MUST be gated explicitly: give them
+// a FieldRule with Read:false (or a MaskStrategy), or set a restrictive "*"
+// default. Omitting BOTH leaves the field visible to anyone holding the
+// object-level read grant.
 type PolicyRule struct {
 	Create           bool
 	Read             bool
@@ -108,9 +116,17 @@ func (b CompiledBundle) RuleFor(tenant, role, objectType string) PolicyRule {
 
 // mergeRule layers a tenant override on top of a system-default base. Action
 // booleans are ORed so the tenant can only grant additional access (tenant
-// precedence). Fields entries from the override replace or add to the base.
-// RecordConditions from the override replace the base entirely when non-empty,
-// otherwise the base conditions are kept.
+// precedence). Fields entries from the override replace or add to the base
+// (field-level restriction is the tenant's prerogative, override wins).
+//
+// RecordConditions are CONCATENATED (base ++ override), not replaced. Because
+// CanRecord requires ALL conditions to pass, concatenation is a logical AND: a
+// tenant customizing a SYSTEM role can only TIGHTEN record scope (add
+// conditions), never drop a system-level row scope such as
+// owner_id == $user_id. A tenant that wants broader visibility instead defines
+// a NEW custom role — that role has no system default, so RuleFor performs no
+// merge and the custom role's conditions stand alone. Exact duplicate
+// conditions (same Field+Op+Value) are deduped to avoid redundant checks.
 func mergeRule(base, override PolicyRule) PolicyRule {
 	out := PolicyRule{
 		Create:    base.Create || override.Create,
@@ -131,10 +147,25 @@ func mergeRule(base, override PolicyRule) PolicyRule {
 		}
 	}
 
-	if len(override.RecordConditions) > 0 {
-		out.RecordConditions = override.RecordConditions
-	} else {
-		out.RecordConditions = base.RecordConditions
+	// Append-AND base then override conditions, deduping exact duplicates.
+	if len(base.RecordConditions) > 0 || len(override.RecordConditions) > 0 {
+		seen := make(map[Condition]struct{}, len(base.RecordConditions)+len(override.RecordConditions))
+		merged := make([]Condition, 0, len(base.RecordConditions)+len(override.RecordConditions))
+		for _, c := range base.RecordConditions {
+			if _, dup := seen[c]; dup {
+				continue
+			}
+			seen[c] = struct{}{}
+			merged = append(merged, c)
+		}
+		for _, c := range override.RecordConditions {
+			if _, dup := seen[c]; dup {
+				continue
+			}
+			seen[c] = struct{}{}
+			merged = append(merged, c)
+		}
+		out.RecordConditions = merged
 	}
 
 	return out

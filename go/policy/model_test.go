@@ -74,19 +74,56 @@ func TestBundle_RuleFor_Unknown(t *testing.T) {
 	}
 }
 
-func TestMergeRule_RecordConditionsTenantReplaces(t *testing.T) {
+func TestMergeRule_RecordConditionsAppendAnd(t *testing.T) {
+	ownerCond := Condition{Field: "owner_id", Op: "==", Value: "$user_id"}
+	teamCond := Condition{Field: "team_id", Op: "in", Value: "1,2"}
+	base := PolicyRule{
+		Read: true,
+		// base carries a system-level row scope plus a condition the tenant
+		// will also try to (redundantly) re-specify.
+		RecordConditions: []Condition{ownerCond, teamCond},
+	}
+	override := PolicyRule{
+		Update: true,
+		// tenant tightens by adding a new condition, and redundantly repeats
+		// teamCond (an exact duplicate that must be deduped).
+		RecordConditions: []Condition{teamCond, {Field: "region", Op: "==", Value: "us"}},
+	}
+	got := mergeRule(base, override)
+	want := []Condition{
+		ownerCond,
+		teamCond,
+		{Field: "region", Op: "==", Value: "us"},
+	}
+	if !reflect.DeepEqual(got.RecordConditions, want) {
+		t.Errorf("RecordConditions: want append-AND with dedup %+v, got %+v", want, got.RecordConditions)
+	}
+}
+
+// A tenant override must NOT be able to drop a system-level row scope such as
+// owner_id == $user_id; the base condition survives the merge.
+func TestMergeRule_TenantCannotRemoveBaseOwnerScope(t *testing.T) {
+	ownerCond := Condition{Field: "owner_id", Op: "==", Value: "$user_id"}
 	base := PolicyRule{
 		Read:             true,
-		RecordConditions: []Condition{{Field: "owner_id", Op: "==", Value: "$user_id"}},
+		RecordConditions: []Condition{ownerCond},
 	}
+	// Tenant tries to "broaden" by supplying only a team scope.
 	override := PolicyRule{
 		Update:           true,
 		RecordConditions: []Condition{{Field: "team_id", Op: "in", Value: "1,2"}},
 	}
 	got := mergeRule(base, override)
-	want := []Condition{{Field: "team_id", Op: "in", Value: "1,2"}}
-	if !reflect.DeepEqual(got.RecordConditions, want) {
-		t.Errorf("RecordConditions: tenant should replace base, got %+v", got.RecordConditions)
+
+	found := false
+	for _, c := range got.RecordConditions {
+		if c == ownerCond {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("base owner_id scope must survive tenant override, got %+v", got.RecordConditions)
 	}
 }
 

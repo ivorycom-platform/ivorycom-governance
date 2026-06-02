@@ -11,9 +11,19 @@ import (
 // object-type name, so it cannot collide with real values.
 const roleObjSep = "\x1f"
 
-// roleObjKey renders a RoleObj as its JSON map-key string.
-func roleObjKey(k RoleObj) string {
-	return k.Role + roleObjSep + k.ObjectType
+// roleObjKey renders a RoleObj as its JSON map-key string. It rejects a Role or
+// ObjectType containing the roleObjSep byte: such a name would produce a key
+// that parseRoleObjKey splits in the wrong place, silently corrupting the
+// round-trip. The separator invariant is enforced here, marshal-side, so signed
+// bundles are always parseable.
+func roleObjKey(k RoleObj) (string, error) {
+	if strings.Contains(k.Role, roleObjSep) {
+		return "", fmt.Errorf("policy: role %q contains reserved key separator (\\x1f)", k.Role)
+	}
+	if strings.Contains(k.ObjectType, roleObjSep) {
+		return "", fmt.Errorf("policy: object_type %q contains reserved key separator (\\x1f)", k.ObjectType)
+	}
+	return k.Role + roleObjSep + k.ObjectType, nil
 }
 
 // parseRoleObjKey reverses roleObjKey.
@@ -42,7 +52,11 @@ func (b CompiledBundle) MarshalJSON() ([]byte, error) {
 	if len(b.System) > 0 {
 		w.System = make(map[string]PolicyRule, len(b.System))
 		for k, v := range b.System {
-			w.System[roleObjKey(k)] = v
+			ks, err := roleObjKey(k)
+			if err != nil {
+				return nil, err
+			}
+			w.System[ks] = v
 		}
 	}
 	if len(b.Tenant) > 0 {
@@ -50,7 +64,11 @@ func (b CompiledBundle) MarshalJSON() ([]byte, error) {
 		for tenant, rules := range b.Tenant {
 			m := make(map[string]PolicyRule, len(rules))
 			for k, v := range rules {
-				m[roleObjKey(k)] = v
+				ks, err := roleObjKey(k)
+				if err != nil {
+					return nil, err
+				}
+				m[ks] = v
 			}
 			w.Tenant[tenant] = m
 		}
