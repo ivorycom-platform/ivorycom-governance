@@ -1,4 +1,4 @@
-module github.com/ivorycom/ivorycom-governance/go
+module github.com/ivorycom-platform/ivorycom-governance/go
 
 go 1.22
 
