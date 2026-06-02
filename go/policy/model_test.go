@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -98,5 +99,41 @@ func TestMergeRule_RecordConditionsEmptyOverrideKeepsBase(t *testing.T) {
 	got := mergeRule(base, override)
 	if len(got.RecordConditions) != 1 || got.RecordConditions[0].Field != "owner_id" {
 		t.Errorf("empty override should keep base conditions, got %+v", got.RecordConditions)
+	}
+}
+
+func TestCompiledBundle_JSONRoundTrip(t *testing.T) {
+	in := CompiledBundle{
+		Version: 7,
+		System: map[RoleObj]PolicyRule{
+			{Role: "viewer", ObjectType: "contact"}: {
+				Read:   true,
+				Fields: map[string]FieldRule{"ssn": {Read: true, MaskStrategy: "redact"}},
+			},
+		},
+		Tenant: map[string]map[RoleObj]PolicyRule{
+			"tenant-a": {
+				{Role: "viewer", ObjectType: "contact"}: {
+					Update:           true,
+					RecordConditions: []Condition{{Field: "owner_id", Op: "==", Value: "$user_id"}},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out CompiledBundle
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("round-trip mismatch:\n in=%+v\nout=%+v", in, out)
+	}
+	// Marshal must be deterministic (signed-body stability).
+	raw2, _ := json.Marshal(in)
+	if string(raw) != string(raw2) {
+		t.Errorf("marshal not deterministic:\n%s\n%s", raw, raw2)
 	}
 }
