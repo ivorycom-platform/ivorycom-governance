@@ -170,3 +170,103 @@ func contains(s []string, v string) bool {
 	}
 	return false
 }
+
+func TestCanRecord_OwnerCondition(t *testing.T) {
+	const role, obj = "rep", "opportunity"
+	e := staticEngine(CompiledBundle{
+		Version: 1,
+		System: map[RoleObj]PolicyRule{
+			{Role: role, ObjectType: obj}: {
+				Read:             true,
+				Update:           true,
+				RecordConditions: []Condition{{Field: "owner_id", Op: "==", Value: "$user_id"}},
+			},
+		},
+	})
+	id := Identity{TenantID: "t1", UserID: "u-42", UserRole: role}
+
+	own := map[string]any{"owner_id": "u-42", "stage": "open"}
+	if got := e.CanRecord(id, "update", obj, own); !got.Allow {
+		t.Errorf("own record: want allow, got %+v", got)
+	}
+	other := map[string]any{"owner_id": "u-99"}
+	if got := e.CanRecord(id, "update", obj, other); got.Allow {
+		t.Errorf("other's record: want deny, got %+v", got)
+	}
+}
+
+func TestCanRecord_MultipleConditionsAND(t *testing.T) {
+	const role, obj = "rep", "deal"
+	e := staticEngine(CompiledBundle{
+		Version: 1,
+		System: map[RoleObj]PolicyRule{
+			{Role: role, ObjectType: obj}: {
+				Read: true,
+				RecordConditions: []Condition{
+					{Field: "tenant_id", Op: "==", Value: "$tenant_id"},
+					{Field: "region", Op: "in", Value: "us,eu"},
+					{Field: "archived", Op: "!=", Value: "true"},
+				},
+			},
+		},
+	})
+	id := Identity{TenantID: "t1", UserID: "u1", UserRole: role}
+
+	ok := map[string]any{"tenant_id": "t1", "region": "eu", "archived": "false"}
+	if got := e.CanRecord(id, "read", obj, ok); !got.Allow {
+		t.Errorf("all conditions pass: want allow, got %+v", got)
+	}
+	// region not in set
+	bad := map[string]any{"tenant_id": "t1", "region": "apac", "archived": "false"}
+	if got := e.CanRecord(id, "read", obj, bad); got.Allow {
+		t.Errorf("region apac: want deny, got %+v", got)
+	}
+	// wrong tenant
+	wrongTenant := map[string]any{"tenant_id": "t2", "region": "eu", "archived": "false"}
+	if got := e.CanRecord(id, "read", obj, wrongTenant); got.Allow {
+		t.Errorf("wrong tenant: want deny, got %+v", got)
+	}
+	// archived == true -> != fails
+	arch := map[string]any{"tenant_id": "t1", "region": "eu", "archived": "true"}
+	if got := e.CanRecord(id, "read", obj, arch); got.Allow {
+		t.Errorf("archived: want deny, got %+v", got)
+	}
+}
+
+func TestCanRecord_NoConditionsFallsThroughToCan(t *testing.T) {
+	const role, obj = "rep", "note"
+	e := staticEngine(CompiledBundle{
+		Version: 1,
+		System: map[RoleObj]PolicyRule{
+			{Role: role, ObjectType: obj}: {Read: true},
+		},
+	})
+	id := Identity{TenantID: "t1", UserID: "u1", UserRole: role}
+	if got := e.CanRecord(id, "read", obj, map[string]any{"x": 1}); !got.Allow {
+		t.Errorf("no conditions: want allow (same as Can), got %+v", got)
+	}
+	if got := e.CanRecord(id, "delete", obj, map[string]any{"x": 1}); got.Allow {
+		t.Errorf("delete not granted: want deny, got %+v", got)
+	}
+}
+
+func TestCanRecord_NonStringRecordValue(t *testing.T) {
+	const role, obj = "rep", "opportunity"
+	e := staticEngine(CompiledBundle{
+		Version: 1,
+		System: map[RoleObj]PolicyRule{
+			{Role: role, ObjectType: obj}: {
+				Read:             true,
+				RecordConditions: []Condition{{Field: "amount", Op: "==", Value: "100"}},
+			},
+		},
+	})
+	id := Identity{TenantID: "t1", UserID: "u1", UserRole: role}
+	// numeric value coerced via fmt
+	if got := e.CanRecord(id, "read", obj, map[string]any{"amount": 100}); !got.Allow {
+		t.Errorf("numeric 100 == \"100\": want allow, got %+v", got)
+	}
+	if got := e.CanRecord(id, "read", obj, map[string]any{"amount": 101}); got.Allow {
+		t.Errorf("numeric 101: want deny, got %+v", got)
+	}
+}
