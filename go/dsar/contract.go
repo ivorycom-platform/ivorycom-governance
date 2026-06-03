@@ -27,6 +27,12 @@ import "time"
 type ExportRequest struct {
 	ContactID string `json:"contact_id"`
 	TenantID  string `json:"tenant_id"`
+	// Email is the contact's email when known. Contexts whose rows carry no
+	// contact UUID but do carry the person's email (billing payer emails,
+	// marketing recipient emails) match on it; empty means "UUID-keyed rows
+	// only". Supplied by the DSAR requester (Trust Center / admin) and threaded
+	// through the saga.
+	Email string `json:"email,omitempty"`
 }
 
 // Slice is one named collection of a context's rows referencing the contact.
@@ -58,8 +64,10 @@ type ExportResponse struct {
 type DeleteRequest struct {
 	ContactID string `json:"contact_id"`
 	TenantID  string `json:"tenant_id"`
-	Mode      string `json:"mode"` // "delete" | "anonymize"
-	Held      bool   `json:"held"`
+	// Email — see ExportRequest.Email; email-keyed contexts erase by it.
+	Email string `json:"email,omitempty"`
+	Mode  string `json:"mode"` // "delete" | "anonymize"
+	Held  bool   `json:"held"`
 }
 
 // DeleteResponse reports the outcome of a context's erasure: how many rows were
