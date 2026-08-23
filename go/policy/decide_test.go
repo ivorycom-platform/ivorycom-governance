@@ -181,7 +181,7 @@ func agentBundle(mode AutonomyMode, capMaxRisk, autoMaxRisk RiskLevel, reqApprov
 			},
 		},
 		Capabilities: map[string]map[CapKey]CapabilityRule{
-			"t1": {{AgentRole: "sales_agent", ToolAction: "crm.update_lead"}: {
+			"t1": {{AgentRole: "sales-agent", ToolAction: "crm.update_lead"}: {
 				Allow: true, MaxRisk: capMaxRisk, RequiresApproval: reqApproval,
 			}},
 		},
@@ -408,7 +408,7 @@ func TestBundleWire_RoundTripsCapabilitiesAndAutonomy(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	cap, ok := back.CapabilityFor("t1", "sales_agent", "crm.update_lead")
+	cap, ok := back.CapabilityFor("t1", "sales-agent", "crm.update_lead")
 	if !ok {
 		t.Fatal("capability did not survive the wire round-trip")
 	}
@@ -489,5 +489,91 @@ func TestDecide_AbsentBundleReportsVersionZero(t *testing.T) {
 	}
 	if got.PolicyVersion != 0 {
 		t.Fatalf("with no bundle loaded there is no version to report, got %d", got.PolicyVersion)
+	}
+}
+
+// TestDecide_CapabilityIsKeyedByAgentIdentityNotUserRole asserts an agent's
+// capabilities belong to the AGENT, not to whoever it is acting for.
+//
+// Keying them by UserRole would mean any agent acting on behalf of an admin
+// inherits admin capabilities — the opposite of the least-privilege,
+// specialized-agent model. The RBAC role still governs which OBJECTS may be
+// touched; the agent identity governs which TOOLS it may invoke.
+func TestDecide_CapabilityIsKeyedByAgentIdentityNotUserRole(t *testing.T) {
+	b := CompiledBundle{
+		Version: 5,
+		// The human role the agent acts for can read+update leads.
+		System: map[RoleObj]PolicyRule{
+			{Role: "admin", ObjectType: "lead"}: {Read: true, Update: true},
+		},
+		// The capability is granted to the AGENT "sales-agent".
+		Capabilities: map[string]map[CapKey]CapabilityRule{
+			"t1": {{AgentRole: "sales-agent", ToolAction: "crm.update_lead"}: {
+				Allow: true, MaxRisk: RiskMedium,
+			}},
+		},
+		Autonomy: map[string]AutonomyProfile{
+			"t1": {Mode: AutonomyEnabled, MaxAutoRisk: RiskMedium},
+		},
+	}
+	e := NewEngine(func() CompiledBundle { return b })
+
+	req := DecisionRequest{
+		Identity: Identity{
+			TenantID: "t1", UserRole: "admin",
+			ActorType: ActorAgent, AgentID: "sales-agent",
+		},
+		Action: "crm.update_lead", ObjectType: "lead", ActionVerb: "update", Risk: RiskMedium,
+	}
+
+	if got := e.Decide(req); got.Effect != EffectAllow {
+		t.Fatalf("the agent holding the capability must be allowed, got %q/%q",
+			got.Effect, got.ReasonCode)
+	}
+
+	// A DIFFERENT agent, acting for the SAME admin role, holds no capability.
+	other := req
+	other.Identity.AgentID = "marketing-agent"
+	if got := e.Decide(other); got.Effect != EffectDeny || got.ReasonCode != ReasonNoCapability {
+		t.Fatalf("a different agent must not inherit capabilities from the user's role, got %q/%q",
+			got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_AgentWithoutAnIdentityIsDenied asserts an agent-class request with
+// no agent id cannot be authorized: there is no identity to attach capabilities
+// to, so allowing it would mean an anonymous agent.
+//
+// The bundle deliberately contains a capability under the EMPTY key. Without an
+// explicit guard the map lookup would FIND it and allow the call, so this test
+// isolates the guard rather than passing incidentally because a lookup missed.
+func TestDecide_AgentWithoutAnIdentityIsDenied(t *testing.T) {
+	b := CompiledBundle{
+		Version: 5,
+		System: map[RoleObj]PolicyRule{
+			{Role: "admin", ObjectType: "lead"}: {Read: true, Update: true},
+		},
+		Capabilities: map[string]map[CapKey]CapabilityRule{
+			"t1": {{AgentRole: "", ToolAction: "crm.update_lead"}: {
+				Allow: true, MaxRisk: RiskHigh,
+			}},
+		},
+		Autonomy: map[string]AutonomyProfile{
+			"t1": {Mode: AutonomyEnabled, MaxAutoRisk: RiskHigh},
+		},
+	}
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(DecisionRequest{
+		Identity: Identity{
+			TenantID: "t1", UserRole: "admin",
+			ActorType: ActorAgent, AgentID: "", // anonymous
+		},
+		Action: "crm.update_lead", ObjectType: "lead", ActionVerb: "update", Risk: RiskMedium,
+	})
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonNoCapability {
+		t.Fatalf("an anonymous agent must be denied even if a capability exists under the empty key, got %q/%q",
+			got.Effect, got.ReasonCode)
 	}
 }
