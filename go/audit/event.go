@@ -30,8 +30,15 @@ const (
 
 // AuditEvent is the canonical immutable audit-ledger envelope.
 type AuditEvent struct {
-	ID         string          `json:"id"`
-	TenantID   string          `json:"tenant_id"`
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	// ActorType is the actor class that performed the action (USER/ADMIN/
+	// SERVICE/AGENT/AUTOMATION/EXTERNAL_INTEGRATION/SYSTEM). Emitters SHOULD
+	// set it explicitly. It is omitempty so an older emitter still produces a
+	// valid event; the audit consumer derives a conservative value in that
+	// case rather than dropping the event, because losing an audit record is
+	// worse than a briefly less precise one.
+	ActorType  string          `json:"actor_type,omitempty"`
 	UserID     string          `json:"user_id,omitempty"`
 	AgentID    string          `json:"agent_id,omitempty"`
 	Action     Action          `json:"action"`
