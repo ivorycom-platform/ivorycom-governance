@@ -577,3 +577,92 @@ func TestDecide_AgentWithoutAnIdentityIsDenied(t *testing.T) {
 			got.Effect, got.ReasonCode)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A verified approval authorises the ACTION, and only relaxes WHO executes it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestDecide_ApprovedActionMayBeExecutedByAServiceWithoutItsOwnRBACRight.
+//
+// A tenant purge is carried out by a background worker. Requiring that worker to
+// independently hold delete-on-tenant would mean no approved destructive action
+// could ever be executed by the platform that approved it — the approval machine
+// would be unusable for the one workflow it was built for.
+//
+// The right was checked on the APPROVER, by the identity authority, at the
+// moment they approved. The worker is the executor, not the authority.
+func TestDecide_ApprovedActionMayBeExecutedByAServiceWithoutItsOwnRBACRight(t *testing.T) {
+	// A bundle that grants the service NOTHING on tenant.
+	b := bundleWithRule("t1", "owner", "tenant")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	req := DecisionRequest{
+		Identity:          Identity{TenantID: "t1", ActorType: ActorService},
+		Action:            "tenant.wipe",
+		ObjectType:        "tenant",
+		ActionVerb:        "delete",
+		Risk:              RiskCritical,
+		ServiceAllowed:    true,
+		MutatesTenantData: true,
+	}
+
+	// Without an approval: refused on the resource, as before.
+	if got := e.Decide(req); got.Effect != EffectDeny || got.ReasonCode != ReasonResourceDenied {
+		t.Fatalf("an unapproved service purge must be denied on the resource, got %s/%s", got.Effect, got.ReasonCode)
+	}
+
+	// With a verified approval: permitted.
+	req.ApprovalVerified = true
+	if got := e.Decide(req); got.Effect != EffectAllow {
+		t.Fatalf("an APPROVED purge must be executable by the service carrying it out, got %s/%s (%s)",
+			got.Effect, got.ReasonCode, got.Reason)
+	}
+}
+
+// TestDecide_ApprovalDoesNotLiftTheAbsoluteDenials is the other half, and the
+// more important one: an approval relaxes WHO may carry an action out. It must
+// never relax WHAT may be carried out.
+func TestDecide_ApprovalDoesNotLiftTheAbsoluteDenials(t *testing.T) {
+	b := bundleWithRule("t1", "owner", "tenant")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	base := DecisionRequest{
+		Identity:          Identity{TenantID: "t1", UserRole: "owner", ActorType: ActorAgent, AgentID: "a1"},
+		Action:            "tenant.wipe",
+		ObjectType:        "tenant",
+		ActionVerb:        "delete",
+		Risk:              RiskCritical,
+		ServiceAllowed:    true,
+		MutatesTenantData: true,
+		ApprovalVerified:  true,
+	}
+
+	// An agent may never execute CRITICAL, approval or not.
+	if got := e.Decide(base); got.Effect != EffectDeny || got.ReasonCode != ReasonCriticalAgentProhibited {
+		t.Fatalf("an approval must not let an agent execute CRITICAL, got %s/%s", got.Effect, got.ReasonCode)
+	}
+
+	// A service that is not a permitted executor for the action is still refused:
+	// the approval says the ACTION is authorised, not that anything may run it.
+	svc := base
+	svc.Identity = Identity{TenantID: "t1", ActorType: ActorService}
+	svc.ServiceAllowed = false
+	if got := e.Decide(svc); got.Effect != EffectDeny || got.ReasonCode != ReasonResourceDenied {
+		t.Fatalf("an approval must not make an unpermitted service executor allowed, got %s/%s", got.Effect, got.ReasonCode)
+	}
+
+	// SYSTEM still may not mutate tenant data.
+	sys := base
+	sys.Identity = Identity{TenantID: "t1", ActorType: ActorSystem}
+	if got := e.Decide(sys); got.Effect != EffectDeny {
+		t.Fatalf("an approval must not let SYSTEM mutate tenant data, got %s", got.Effect)
+	}
+
+	// An external integration is still capped at MEDIUM.
+	ext := base
+	ext.Identity = Identity{TenantID: "t1", UserRole: "owner", ActorType: ActorExternalIntegration}
+	ext.Risk = RiskHigh
+	if got := e.Decide(ext); got.Effect != EffectDeny || got.ReasonCode != ReasonExternalRiskCap {
+		t.Fatalf("an approval must not lift the external-integration risk cap, got %s/%s", got.Effect, got.ReasonCode)
+	}
+}

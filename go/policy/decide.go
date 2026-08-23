@@ -161,6 +161,11 @@ func deny(version int, code, msg string) DecisionResult {
 // approval would launder a denial. Stages therefore run A (universal denials),
 // B (agent-class denials), then E (outcome selection).
 //
+// The ONE place a verified approval participates in Stage A is the RBAC gate,
+// and the reasoning for that narrow exception is written out where it happens.
+// It relaxes WHO may carry an approved action out; it never relaxes WHAT may be
+// carried out.
+//
 // Limits are deliberately NOT evaluated here. Counting requires mutable state
 // and Decide is stateless, so it returns the tenant's Limits in
 // LimitsRequired for the caller to reserve atomically before execution.
@@ -205,8 +210,34 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 	// Object/field authorization. Record-level (ABAC) authorization is NOT
 	// evaluated here: it needs trusted record attributes that only the owning
 	// service holds, so it happens there, inside the mutation transaction.
+	//
+	// A VERIFIED APPROVAL satisfies this gate, and only this gate.
+	//
+	// The RBAC question is "does this actor hold the right on this object?" For
+	// an approved action the actor who holds the right is the APPROVER, and the
+	// caller is the executor carrying out their decision. A tenant purge is
+	// performed by a background worker; requiring that worker to independently
+	// hold delete-on-tenant would mean no approved destructive action could ever
+	// be executed by the platform that approved it — the approval machine would
+	// be unusable for the one workflow it was built for.
+	//
+	// This is NOT approval laundering a denial, and the distinction matters:
+	//   * the approval only exists because an EARLIER request passed this same
+	//     gate and returned REQUIRE_APPROVAL — a request that was denied here
+	//     never produced anything to approve;
+	//   * the approver's entitlement was verified by the identity authority
+	//     (role + fresh second factor) at the moment they approved;
+	//   * the approval is bound by digest to this exact tenant, action,
+	//     resource, verb, risk and pathway, so it authorises THIS action and
+	//     nothing else.
+	//
+	// Everything above this line still applies: an agent-class actor is refused
+	// CRITICAL outright, an external integration cannot exceed MEDIUM, a service
+	// actor must still be a permitted executor for the action, and SYSTEM still
+	// may not mutate tenant data. An approval relaxes WHO may carry the action
+	// out, never WHAT may be carried out.
 	rbac := e.Can(req.Identity, req.ActionVerb, req.ObjectType, req.Field)
-	if !rbac.Allow {
+	if !rbac.Allow && !req.ApprovalVerified {
 		return deny(bundle.Version, ReasonResourceDenied, rbac.Reason)
 	}
 
