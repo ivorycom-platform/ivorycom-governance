@@ -234,7 +234,17 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 			return deny(bundle.Version, ReasonInvalidPolicyConfig, "tenant limits must be non-negative")
 		}
 
-		cap, ok = bundle.CapabilityFor(req.Identity.TenantID, req.Identity.UserRole, req.Action)
+		// Capabilities belong to the AGENT, not to whoever it acts for. Keying
+		// them by UserRole would let any agent acting on behalf of an admin
+		// inherit admin capabilities — the opposite of the least-privilege,
+		// specialized-agent model. UserRole still governs which OBJECTS may be
+		// touched (the Can check above); the agent identity governs which
+		// TOOLS it may invoke.
+		if req.Identity.AgentID == "" {
+			return deny(bundle.Version, ReasonNoCapability,
+				"agent-class requests require an agent identity to attach capabilities to")
+		}
+		cap, ok = bundle.CapabilityFor(req.Identity.TenantID, req.Identity.AgentID, req.Action)
 		if !ok || !cap.Allow {
 			return deny(bundle.Version, ReasonNoCapability,
 				"no capability grants this agent role the action")
