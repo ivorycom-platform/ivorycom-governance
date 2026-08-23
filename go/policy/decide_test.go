@@ -425,3 +425,69 @@ func TestBundleWire_RoundTripsCapabilitiesAndAutonomy(t *testing.T) {
 		t.Fatalf("autonomy profile corrupted on the wire: %+v", prof)
 	}
 }
+
+// TestDecide_DenialCarriesPolicyVersion asserts a refusal reports which policy
+// produced it. Found by probing the live PDP: a production DENY came back with
+// policy_version 0 even though a bundle was loaded.
+//
+// This matters because a denial is an audit record. "We refused this action,
+// but cannot say under which policy" defeats the attributability the guardrail
+// exists to provide, and makes an observe-mode would-be denial impossible to
+// correlate with the bundle that caused it.
+func TestDecide_DenialCarriesPolicyVersion(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskMedium, RiskMedium, false) // Version 7
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(agentReq(RiskCritical)) // agent CRITICAL -> terminal deny
+
+	if got.Effect != EffectDeny {
+		t.Fatalf("expected DENY, got %q", got.Effect)
+	}
+	if got.PolicyVersion != 7 {
+		t.Fatalf("a denial must report the policy version that produced it, got %d", got.PolicyVersion)
+	}
+}
+
+// TestDecide_EveryDenialPathCarriesPolicyVersion covers the other refusal
+// paths, so the fix cannot regress on one branch while holding on another.
+func TestDecide_EveryDenialPathCarriesPolicyVersion(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskMedium, RiskMedium, false) // Version 7
+	e := NewEngine(func() CompiledBundle { return b })
+
+	noCapability := agentReq(RiskLow)
+	noCapability.Action = "billing.issue_refund"
+
+	unauthorized := agentReq(RiskLow)
+	unauthorized.ActionVerb = "delete"
+
+	badRisk := agentReq(RiskLevel("SPICY"))
+
+	for name, req := range map[string]DecisionRequest{
+		"no_capability":   noCapability,
+		"resource_denied": unauthorized,
+		"invalid_request": badRisk,
+	} {
+		got := e.Decide(req)
+		if got.Effect != EffectDeny {
+			t.Fatalf("%s: expected DENY, got %q", name, got.Effect)
+		}
+		if got.PolicyVersion != 7 {
+			t.Fatalf("%s: denial must carry the policy version, got %d", name, got.PolicyVersion)
+		}
+	}
+}
+
+// TestDecide_AbsentBundleReportsVersionZero asserts the one case where zero is
+// the honest answer: there is no policy loaded, so there is no version.
+func TestDecide_AbsentBundleReportsVersionZero(t *testing.T) {
+	e := NewEngine(func() CompiledBundle { return CompiledBundle{} })
+
+	got := e.Decide(agentReq(RiskLow))
+
+	if got.ReasonCode != ReasonPolicyAbsent {
+		t.Fatalf("expected policy_absent, got %q", got.ReasonCode)
+	}
+	if got.PolicyVersion != 0 {
+		t.Fatalf("with no bundle loaded there is no version to report, got %d", got.PolicyVersion)
+	}
+}

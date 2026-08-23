@@ -141,8 +141,15 @@ func isAgentClass(a ActorType) bool {
 }
 
 // deny is a small constructor keeping every refusal shaped identically.
-func deny(code, msg string) DecisionResult {
-	return DecisionResult{Effect: EffectDeny, ReasonCode: code, Reason: msg}
+//
+// version is required rather than optional: a denial IS an audit record, and
+// one that cannot say which policy produced it defeats the attributability the
+// guardrail exists to provide. Taking it as a parameter means a new refusal
+// path cannot silently omit it.
+func deny(version int, code, msg string) DecisionResult {
+	return DecisionResult{
+		Effect: EffectDeny, ReasonCode: code, Reason: msg, PolicyVersion: version,
+	}
 }
 
 // Decide evaluates an authorization decision under the agent guardrails.
@@ -162,37 +169,37 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 
 	// ---- Preconditions -----------------------------------------------------
 	if bundle.Version <= 0 {
-		return deny(ReasonPolicyAbsent, "no policy bundle loaded")
+		return deny(0, ReasonPolicyAbsent, "no policy bundle loaded")
 	}
 	if !isLiveActor(req.Identity.ActorType) {
-		return deny(ReasonActorTypeMissing, "actor type is missing or not valid on a live request")
+		return deny(bundle.Version, ReasonActorTypeMissing, "actor type is missing or not valid on a live request")
 	}
 	riskOrd, riskKnown := riskOrdinal(req.Risk)
 	if !riskKnown {
-		return deny(ReasonInvalidRequest, "unrecognised risk level")
+		return deny(bundle.Version, ReasonInvalidRequest, "unrecognised risk level")
 	}
 
 	agentClass := isAgentClass(req.Identity.ActorType)
 
 	// ---- Stage A: universal denials ----------------------------------------
 	if agentClass && req.Risk == RiskCritical {
-		return deny(ReasonCriticalAgentProhibited,
+		return deny(bundle.Version, ReasonCriticalAgentProhibited,
 			"CRITICAL actions are never executable by an agent-class actor")
 	}
 	// The EXTERNAL_INTEGRATION ceiling is a hard cap, not an approval prompt:
 	// returning REQUIRE_APPROVAL here would let an approval lift the cap.
 	if req.Identity.ActorType == ActorExternalIntegration {
 		if mediumOrd, _ := riskOrdinal(RiskMedium); riskOrd > mediumOrd {
-			return deny(ReasonExternalRiskCap,
+			return deny(bundle.Version, ReasonExternalRiskCap,
 				"external integrations may not exceed MEDIUM risk")
 		}
 	}
 	if req.Identity.ActorType == ActorService && !req.ServiceAllowed {
-		return deny(ReasonResourceDenied,
+		return deny(bundle.Version, ReasonResourceDenied,
 			"service actors may only invoke registry service_allowed actions")
 	}
 	if req.Identity.ActorType == ActorSystem && req.MutatesTenantData {
-		return deny(ReasonResourceDenied, "system actor may not mutate tenant data")
+		return deny(bundle.Version, ReasonResourceDenied, "system actor may not mutate tenant data")
 	}
 
 	// Object/field authorization. Record-level (ABAC) authorization is NOT
@@ -200,7 +207,7 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 	// service holds, so it happens there, inside the mutation transaction.
 	rbac := e.Can(req.Identity, req.ActionVerb, req.ObjectType, req.Field)
 	if !rbac.Allow {
-		return deny(ReasonResourceDenied, rbac.Reason)
+		return deny(bundle.Version, ReasonResourceDenied, rbac.Reason)
 	}
 
 	// ---- Stage B: agent-class denials --------------------------------------
@@ -208,38 +215,38 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 	if agentClass {
 		profile, ok := bundle.AutonomyFor(req.Identity.TenantID)
 		if !ok {
-			return deny(ReasonAutonomyUnconfigured,
+			return deny(bundle.Version, ReasonAutonomyUnconfigured,
 				"tenant has not configured agent autonomy")
 		}
 		switch profile.Mode {
 		case AutonomyEnabled, AutonomyRestricted:
 			// permitted to continue
 		case AutonomyPaused, AutonomyDisabled:
-			return deny(ReasonAutonomyHalted, "tenant autonomy is "+string(profile.Mode))
+			return deny(bundle.Version, ReasonAutonomyHalted, "tenant autonomy is "+string(profile.Mode))
 		default:
-			return deny(ReasonInvalidPolicyConfig, "unrecognised autonomy mode")
+			return deny(bundle.Version, ReasonInvalidPolicyConfig, "unrecognised autonomy mode")
 		}
 		if _, ok := riskOrdinal(profile.MaxAutoRisk); !ok {
-			return deny(ReasonInvalidPolicyConfig, "tenant MaxAutoRisk is missing or invalid")
+			return deny(bundle.Version, ReasonInvalidPolicyConfig, "tenant MaxAutoRisk is missing or invalid")
 		}
 		if profile.Limits.MaxActionsPerRun < 0 || profile.Limits.MaxActionsPerHour < 0 ||
 			profile.Limits.MaxMoneyMovementMinor < 0 {
-			return deny(ReasonInvalidPolicyConfig, "tenant limits must be non-negative")
+			return deny(bundle.Version, ReasonInvalidPolicyConfig, "tenant limits must be non-negative")
 		}
 
 		cap, ok = bundle.CapabilityFor(req.Identity.TenantID, req.Identity.UserRole, req.Action)
 		if !ok || !cap.Allow {
-			return deny(ReasonNoCapability,
+			return deny(bundle.Version, ReasonNoCapability,
 				"no capability grants this agent role the action")
 		}
 		if _, ok := riskOrdinal(cap.MaxRisk); !ok {
-			return deny(ReasonInvalidPolicyConfig, "capability MaxRisk is missing or invalid")
+			return deny(bundle.Version, ReasonInvalidPolicyConfig, "capability MaxRisk is missing or invalid")
 		}
 
 		// Money movement the tenant has not funded at all is a denial, not an
 		// approval prompt.
 		if req.AmountMinor > 0 && profile.Limits.MaxMoneyMovementMinor == 0 {
-			return deny(ReasonInvalidPolicyConfig,
+			return deny(bundle.Version, ReasonInvalidPolicyConfig,
 				"tenant prohibits money movement by agents")
 		}
 
