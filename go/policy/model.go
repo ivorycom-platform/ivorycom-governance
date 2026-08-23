@@ -81,13 +81,21 @@ type CompiledBundle struct {
 	Version int
 	System  map[RoleObj]PolicyRule
 	Tenant  map[string]map[RoleObj]PolicyRule
+	// Capabilities holds per-tenant agent tool-action grants. Additive: a
+	// bundle without it simply grants no agent any capability, which denies.
+	Capabilities map[string]map[CapKey]CapabilityRule
+	// Autonomy holds each tenant's agent-execution profile. Additive: absent
+	// means the tenant has delegated no autonomy, which denies.
+	Autonomy map[string]AutonomyProfile
 }
 
 // Identity is the authenticated caller for whom a decision is made.
 type Identity struct {
-	TenantID string
-	UserID   string
-	UserRole string
+	ActorType ActorType
+	AgentID   string
+	TenantID  string
+	UserID    string
+	UserRole  string
 }
 
 // RuleFor returns the effective PolicyRule for (tenant, role, objectType): the
@@ -169,4 +177,70 @@ func mergeRule(base, override PolicyRule) PolicyRule {
 	}
 
 	return out
+}
+
+// CapKey identifies an agent capability rule: which agent role may invoke which
+// registry tool action.
+type CapKey struct {
+	AgentRole  string
+	ToolAction string
+}
+
+// CapabilityRule authorizes one tool action for one agent role. Absence of a
+// rule denies: an agent has only the capabilities a tenant has explicitly
+// granted it (least privilege first).
+type CapabilityRule struct {
+	Allow bool
+	// MaxRisk is the highest risk this agent may execute autonomously. Above
+	// it the action requires human approval. Empty is invalid, not unlimited.
+	MaxRisk RiskLevel
+	// RequiresApproval forces approval regardless of risk.
+	RequiresApproval bool
+}
+
+// AutonomyMode is a tenant's global agent-execution switch. It is deliberately
+// independent of AI infrastructure so it keeps working when that is degraded.
+type AutonomyMode string
+
+const (
+	AutonomyEnabled    AutonomyMode = "ENABLED"
+	AutonomyRestricted AutonomyMode = "RESTRICTED"
+	AutonomyPaused     AutonomyMode = "PAUSED"
+	AutonomyDisabled   AutonomyMode = "DISABLED"
+)
+
+// Limits are a tenant's hard ceilings. They are returned to the caller as a
+// requirement to reserve; the engine itself is stateless and never counts.
+type Limits struct {
+	MaxActionsPerRun      int
+	MaxActionsPerHour     int
+	MaxMoneyMovementMinor int64
+}
+
+// AutonomyProfile is a tenant's agent-execution configuration. An absent
+// profile denies — a tenant that has never configured autonomy has not
+// delegated any.
+type AutonomyProfile struct {
+	Mode        AutonomyMode
+	MaxAutoRisk RiskLevel
+	Limits      Limits
+}
+
+// CapabilityFor returns the capability rule for (tenant, agentRole, action) and
+// whether one exists. Tenant rules are the only source: capabilities are never
+// granted platform-wide, because a system-default agent capability would apply
+// to every tenant that never asked for it.
+func (b CompiledBundle) CapabilityFor(tenant, agentRole, action string) (CapabilityRule, bool) {
+	tm, ok := b.Capabilities[tenant]
+	if !ok {
+		return CapabilityRule{}, false
+	}
+	r, ok := tm[CapKey{AgentRole: agentRole, ToolAction: action}]
+	return r, ok
+}
+
+// AutonomyFor returns the tenant's autonomy profile and whether one exists.
+func (b CompiledBundle) AutonomyFor(tenant string) (AutonomyProfile, bool) {
+	p, ok := b.Autonomy[tenant]
+	return p, ok
 }

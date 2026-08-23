@@ -1,0 +1,427 @@
+package policy
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+// bundleWithRule returns a single-rule bundle granting the given role full CRUD
+// on objectType, so that Decide tests exercise the agent-guardrail logic rather
+// than tripping over a missing RBAC rule.
+func bundleWithRule(tenant, role, objectType string) CompiledBundle {
+	return CompiledBundle{
+		Version: 1,
+		System: map[RoleObj]PolicyRule{
+			{Role: role, ObjectType: objectType}: {
+				Create: true, Read: true, Update: true, Delete: true,
+			},
+		},
+	}
+}
+
+// TestDecide_AgentCriticalIsAlwaysDenied asserts the terminal Stage A rule: an
+// agent-class actor may never execute a CRITICAL action, regardless of tenant
+// configuration, capability grants, or approval. This is the guardrail's
+// hardest stop — CRITICAL is not approvable for an agent, it is denied.
+func TestDecide_AgentCriticalIsAlwaysDenied(t *testing.T) {
+	b := bundleWithRule("t1", "sales_agent", "payment")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(DecisionRequest{
+		Identity: Identity{
+			TenantID:  "t1",
+			UserRole:  "sales_agent",
+			ActorType: ActorAgent,
+			AgentID:   "sales-agent",
+		},
+		Action:     "billing.refund",
+		ObjectType: "payment",
+		ActionVerb: "delete",
+		Risk:       RiskCritical,
+	})
+
+	if got.Effect != EffectDeny {
+		t.Fatalf("agent CRITICAL must be DENY, got %q (reason %q)", got.Effect, got.ReasonCode)
+	}
+	if got.ReasonCode != ReasonCriticalAgentProhibited {
+		t.Fatalf("expected reason %q, got %q", ReasonCriticalAgentProhibited, got.ReasonCode)
+	}
+}
+
+// TestDecide_MissingActorTypeIsDenied asserts there is no human default. A
+// request that omits actor_type must be denied, never silently treated as a
+// USER — that default was how an agent could shed its guardrails.
+func TestDecide_MissingActorTypeIsDenied(t *testing.T) {
+	b := bundleWithRule("t1", "member", "lead")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(DecisionRequest{
+		Identity:   Identity{TenantID: "t1", UserRole: "member"},
+		Action:     "crm.read_lead",
+		ObjectType: "lead",
+		ActionVerb: "read",
+		Risk:       RiskLow,
+	})
+
+	if got.Effect != EffectDeny {
+		t.Fatalf("missing actor type must be DENY, got %q", got.Effect)
+	}
+	if got.ReasonCode != ReasonActorTypeMissing {
+		t.Fatalf("expected %q, got %q", ReasonActorTypeMissing, got.ReasonCode)
+	}
+}
+
+// TestDecide_LegacyUnknownActorRejectedOnLiveRequest asserts the audit-only
+// backfill value cannot be used to authorize anything.
+func TestDecide_LegacyUnknownActorRejectedOnLiveRequest(t *testing.T) {
+	b := bundleWithRule("t1", "member", "lead")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(DecisionRequest{
+		Identity:   Identity{TenantID: "t1", UserRole: "member", ActorType: ActorLegacyUnknown},
+		Action:     "crm.read_lead",
+		ObjectType: "lead",
+		ActionVerb: "read",
+		Risk:       RiskLow,
+	})
+
+	if got.Effect != EffectDeny {
+		t.Fatalf("LEGACY_UNKNOWN must be DENY on a live request, got %q", got.Effect)
+	}
+}
+
+// TestDecide_UnknownRiskIsDenied asserts an unrecognised risk value denies
+// rather than falling through to an allow branch.
+func TestDecide_UnknownRiskIsDenied(t *testing.T) {
+	b := bundleWithRule("t1", "member", "lead")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(DecisionRequest{
+		Identity:   Identity{TenantID: "t1", UserRole: "member", ActorType: ActorUser},
+		Action:     "crm.read_lead",
+		ObjectType: "lead",
+		ActionVerb: "read",
+		Risk:       RiskLevel("SPICY"),
+	})
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonInvalidRequest {
+		t.Fatalf("unknown risk must DENY invalid_request, got %q/%q", got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_EmptyBundleIsDenied asserts a cold start is not an open door.
+func TestDecide_EmptyBundleIsDenied(t *testing.T) {
+	e := NewEngine(func() CompiledBundle { return CompiledBundle{} })
+
+	got := e.Decide(DecisionRequest{
+		Identity:   Identity{TenantID: "t1", UserRole: "member", ActorType: ActorUser},
+		Action:     "crm.read_lead",
+		ObjectType: "lead",
+		ActionVerb: "read",
+		Risk:       RiskLow,
+	})
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonPolicyAbsent {
+		t.Fatalf("empty bundle must DENY policy_absent, got %q/%q", got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_HighRiskRequiresApprovalForHumans asserts the HIGH floor applies to
+// every actor type, not just agents, and is reached only after denials.
+func TestDecide_HighRiskRequiresApprovalForHumans(t *testing.T) {
+	b := bundleWithRule("t1", "admin", "payment")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(DecisionRequest{
+		Identity:   Identity{TenantID: "t1", UserRole: "admin", ActorType: ActorAdmin},
+		Action:     "billing.refund",
+		ObjectType: "payment",
+		ActionVerb: "update",
+		Risk:       RiskHigh,
+	})
+
+	if got.Effect != EffectRequireApproval {
+		t.Fatalf("HIGH must REQUIRE_APPROVAL for humans too, got %q", got.Effect)
+	}
+}
+
+// TestDecide_ExternalIntegrationAboveMediumIsHardDenied asserts the cap is a
+// ceiling, not an approval prompt: an EXTERNAL_INTEGRATION cannot reach HIGH
+// even with an approval available.
+func TestDecide_ExternalIntegrationAboveMediumIsHardDenied(t *testing.T) {
+	b := bundleWithRule("t1", "integration", "payment")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(DecisionRequest{
+		Identity: Identity{
+			TenantID: "t1", UserRole: "integration",
+			ActorType: ActorExternalIntegration, AgentID: "zapier",
+		},
+		Action:           "billing.refund",
+		ObjectType:       "payment",
+		ActionVerb:       "update",
+		Risk:             RiskHigh,
+		ApprovalVerified: true,
+	})
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonExternalRiskCap {
+		t.Fatalf("EXTERNAL_INTEGRATION above MEDIUM must DENY external_risk_cap, got %q/%q",
+			got.Effect, got.ReasonCode)
+	}
+}
+
+// agentBundle builds a bundle with RBAC, one capability and an autonomy profile,
+// so agent-path tests can vary one dimension at a time.
+func agentBundle(mode AutonomyMode, capMaxRisk, autoMaxRisk RiskLevel, reqApproval bool) CompiledBundle {
+	return CompiledBundle{
+		Version: 7,
+		System: map[RoleObj]PolicyRule{
+			{Role: "sales_agent", ObjectType: "lead"}: {
+				Create: true, Read: true, Update: true,
+			},
+		},
+		Capabilities: map[string]map[CapKey]CapabilityRule{
+			"t1": {{AgentRole: "sales_agent", ToolAction: "crm.update_lead"}: {
+				Allow: true, MaxRisk: capMaxRisk, RequiresApproval: reqApproval,
+			}},
+		},
+		Autonomy: map[string]AutonomyProfile{
+			"t1": {Mode: mode, MaxAutoRisk: autoMaxRisk,
+				Limits: Limits{MaxActionsPerRun: 25, MaxActionsPerHour: 100, MaxMoneyMovementMinor: 5000}},
+		},
+	}
+}
+
+func agentReq(risk RiskLevel) DecisionRequest {
+	return DecisionRequest{
+		Identity: Identity{
+			TenantID: "t1", UserRole: "sales_agent",
+			ActorType: ActorAgent, AgentID: "sales-agent",
+		},
+		Action:     "crm.update_lead",
+		ObjectType: "lead",
+		ActionVerb: "update",
+		Risk:       risk,
+	}
+}
+
+// TestDecide_AgentWithinCapabilityIsAllowed is the positive path: a granted
+// action at or below both ceilings executes autonomously.
+func TestDecide_AgentWithinCapabilityIsAllowed(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskMedium, RiskMedium, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(agentReq(RiskMedium))
+
+	if got.Effect != EffectAllow {
+		t.Fatalf("expected ALLOW, got %q (%s)", got.Effect, got.ReasonCode)
+	}
+	if got.PolicyVersion != 7 {
+		t.Fatalf("decision must carry the bundle version, got %d", got.PolicyVersion)
+	}
+	if got.LimitsRequired.MaxActionsPerHour != 100 {
+		t.Fatalf("agent decision must return limits to reserve, got %+v", got.LimitsRequired)
+	}
+}
+
+// TestDecide_AgentWithoutCapabilityIsDenied asserts absence denies: an agent has
+// only what a tenant explicitly granted.
+func TestDecide_AgentWithoutCapabilityIsDenied(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskMedium, RiskMedium, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	req := agentReq(RiskLow)
+	req.Action = "billing.issue_refund" // never granted
+
+	got := e.Decide(req)
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonNoCapability {
+		t.Fatalf("ungranted action must DENY no_capability, got %q/%q", got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_AutonomyPausedDeniesAgent asserts the tenant kill switch stops
+// agent execution outright.
+func TestDecide_AutonomyPausedDeniesAgent(t *testing.T) {
+	b := agentBundle(AutonomyPaused, RiskMedium, RiskMedium, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(agentReq(RiskLow))
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonAutonomyHalted {
+		t.Fatalf("PAUSED autonomy must DENY autonomy_halted, got %q/%q", got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_AutonomyUnconfiguredDeniesAgent asserts a tenant that never
+// configured autonomy has delegated none.
+func TestDecide_AutonomyUnconfiguredDeniesAgent(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskMedium, RiskMedium, false)
+	delete(b.Autonomy, "t1")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(agentReq(RiskLow))
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonAutonomyUnconfigured {
+		t.Fatalf("expected autonomy_unconfigured, got %q/%q", got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_AboveCapabilityMaxRiskRequiresApproval asserts exceeding the
+// agent's own ceiling escalates to a human rather than denying outright.
+func TestDecide_AboveCapabilityMaxRiskRequiresApproval(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskLow, RiskMedium, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(agentReq(RiskMedium))
+
+	if got.Effect != EffectRequireApproval {
+		t.Fatalf("above capability MaxRisk must REQUIRE_APPROVAL, got %q", got.Effect)
+	}
+}
+
+// TestDecide_RestrictedModeEscalatesAboveLow asserts RESTRICTED forces approval
+// for anything above LOW even when capability would allow it.
+func TestDecide_RestrictedModeEscalatesAboveLow(t *testing.T) {
+	b := agentBundle(AutonomyRestricted, RiskMedium, RiskMedium, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	got := e.Decide(agentReq(RiskMedium))
+
+	if got.Effect != EffectRequireApproval {
+		t.Fatalf("RESTRICTED above LOW must REQUIRE_APPROVAL, got %q", got.Effect)
+	}
+}
+
+// TestDecide_VerifiedApprovalConvertsToAllow asserts the successful transition:
+// without it an approval-requiring action could never execute.
+func TestDecide_VerifiedApprovalConvertsToAllow(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskLow, RiskLow, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	req := agentReq(RiskMedium)
+	req.ApprovalVerified = true
+
+	got := e.Decide(req)
+
+	if got.Effect != EffectAllow {
+		t.Fatalf("verified approval must ALLOW, got %q (%s)", got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_ApprovalCannotLiftAgentCriticalProhibition asserts approval never
+// launders the hardest stop.
+func TestDecide_ApprovalCannotLiftAgentCriticalProhibition(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskCritical, RiskCritical, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	req := agentReq(RiskCritical)
+	req.ApprovalVerified = true
+
+	got := e.Decide(req)
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonCriticalAgentProhibited {
+		t.Fatalf("approval must not lift agent CRITICAL, got %q/%q", got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_MoneyMovementDeniedWhenTenantProhibits asserts a zero money ceiling
+// is a prohibition, not an approval prompt.
+func TestDecide_MoneyMovementDeniedWhenTenantProhibits(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskMedium, RiskMedium, false)
+	p := b.Autonomy["t1"]
+	p.Limits.MaxMoneyMovementMinor = 0
+	b.Autonomy["t1"] = p
+	e := NewEngine(func() CompiledBundle { return b })
+
+	req := agentReq(RiskMedium)
+	req.AmountMinor = 100
+
+	got := e.Decide(req)
+
+	if got.Effect != EffectDeny {
+		t.Fatalf("money movement with a zero ceiling must DENY, got %q", got.Effect)
+	}
+}
+
+// TestDecide_UnauthorizedResourceDeniedBeforeApproval is the ordering guard: a
+// HIGH action the role cannot perform must DENY, never become a pending
+// approval that could later execute.
+func TestDecide_UnauthorizedResourceDeniedBeforeApproval(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskHigh, RiskHigh, false)
+	e := NewEngine(func() CompiledBundle { return b })
+
+	req := agentReq(RiskHigh)
+	req.ActionVerb = "delete" // rule grants only create/read/update
+
+	got := e.Decide(req)
+
+	if got.Effect != EffectDeny || got.ReasonCode != ReasonResourceDenied {
+		t.Fatalf("unauthorized resource must DENY before approval, got %q/%q",
+			got.Effect, got.ReasonCode)
+	}
+}
+
+// TestDecide_HumanRbacBehaviourUnchanged is the regression guard for existing
+// callers: a USER decision must still follow Can exactly.
+func TestDecide_HumanRbacBehaviourUnchanged(t *testing.T) {
+	b := bundleWithRule("t1", "member", "lead")
+	e := NewEngine(func() CompiledBundle { return b })
+
+	id := Identity{TenantID: "t1", UserRole: "member", ActorType: ActorUser}
+
+	allowed := e.Decide(DecisionRequest{
+		Identity: id, Action: "crm.read_lead",
+		ObjectType: "lead", ActionVerb: "read", Risk: RiskLow,
+	})
+	if allowed.Effect != EffectAllow {
+		t.Fatalf("granted human read must ALLOW, got %q", allowed.Effect)
+	}
+
+	denied := e.Decide(DecisionRequest{
+		Identity: id, Action: "crm.read_invoice",
+		ObjectType: "invoice", ActionVerb: "read", Risk: RiskLow,
+	})
+	if denied.Effect != EffectDeny {
+		t.Fatalf("human read of an ungoverned object must DENY, got %q", denied.Effect)
+	}
+	if !e.Can(id, "read", "lead", "").Allow {
+		t.Fatal("Can must remain unchanged for existing callers")
+	}
+}
+
+// TestBundleWire_RoundTripsCapabilitiesAndAutonomy guards a silent-failure mode:
+// CompiledBundle has custom JSON marshalling, and the bundle is distributed to
+// every service as signed JSON. If the new capability/autonomy maps are not on
+// the wire they would be silently empty at every consumer — which denies every
+// agent action while looking like a correctly-signed bundle.
+func TestBundleWire_RoundTripsCapabilitiesAndAutonomy(t *testing.T) {
+	orig := agentBundle(AutonomyRestricted, RiskMedium, RiskHigh, true)
+
+	raw, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var back CompiledBundle
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	cap, ok := back.CapabilityFor("t1", "sales_agent", "crm.update_lead")
+	if !ok {
+		t.Fatal("capability did not survive the wire round-trip")
+	}
+	if !cap.Allow || cap.MaxRisk != RiskMedium || !cap.RequiresApproval {
+		t.Fatalf("capability corrupted on the wire: %+v", cap)
+	}
+
+	prof, ok := back.AutonomyFor("t1")
+	if !ok {
+		t.Fatal("autonomy profile did not survive the wire round-trip")
+	}
+	if prof.Mode != AutonomyRestricted || prof.MaxAutoRisk != RiskHigh ||
+		prof.Limits.MaxActionsPerHour != 100 || prof.Limits.MaxMoneyMovementMinor != 5000 {
+		t.Fatalf("autonomy profile corrupted on the wire: %+v", prof)
+	}
+}
