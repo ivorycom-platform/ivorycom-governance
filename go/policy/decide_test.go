@@ -666,3 +666,89 @@ func TestDecide_ApprovalDoesNotLiftTheAbsoluteDenials(t *testing.T) {
 		t.Fatalf("an approval must not lift the external-integration risk cap, got %s/%s", got.Effect, got.ReasonCode)
 	}
 }
+
+// ---- delegated HIGH autonomy (2026-08-26) ---------------------------------
+//
+// The owner's product decision: a tenant may configure an agent to carry a
+// whole workflow (build, approve, publish and send a campaign; issue a quote)
+// without a human clicking through each step. The engine's HIGH floor now
+// yields to an EXPLICIT delegation — autonomy ENABLED at HIGH plus a HIGH
+// capability without a per-tool approval flag — and to nothing less. The
+// guardrail set (money movement, destructive deletes, billing/security
+// configuration) never yields.
+
+func TestDecide_AgentHighAutoExecutesOnlyUnderExplicitHighDelegation(t *testing.T) {
+	cases := []struct {
+		name string
+		mode AutonomyMode
+		cap  RiskLevel
+		auto RiskLevel
+		req  bool
+		want Effect
+	}{
+		{"enabled+high cap+high ceiling → allow", AutonomyEnabled, RiskHigh, RiskHigh, false, EffectAllow},
+		{"capability demands approval → approval", AutonomyEnabled, RiskHigh, RiskHigh, true, EffectRequireApproval},
+		{"tenant ceiling MEDIUM → approval", AutonomyEnabled, RiskHigh, RiskMedium, false, EffectRequireApproval},
+		{"capability ceiling MEDIUM → approval", AutonomyEnabled, RiskMedium, RiskHigh, false, EffectRequireApproval},
+		{"RESTRICTED mode → approval", AutonomyRestricted, RiskHigh, RiskHigh, false, EffectRequireApproval},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := agentBundle(tc.mode, tc.cap, tc.auto, tc.req)
+			e := NewEngine(func() CompiledBundle { return b })
+			got := e.Decide(agentReq(RiskHigh))
+			if got.Effect != tc.want {
+				t.Fatalf("want %q, got %q (%s)", tc.want, got.Effect, got.ReasonCode)
+			}
+		})
+	}
+}
+
+func TestDecide_HighDelegationNeverLiftsTheGuardrailSet(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskHigh, RiskHigh, false)
+	// The principal may delete leads (RBAC is a precondition, not the subject here).
+	b.System[RoleObj{Role: "sales_agent", ObjectType: "lead"}] = PolicyRule{Create: true, Read: true, Update: true, Delete: true}
+	e := NewEngine(func() CompiledBundle { return b })
+
+	money := agentReq(RiskMedium)
+	money.AmountMinor = 1250 // within the tenant's funded limit — still confirmed
+	if got := e.Decide(money); got.Effect != EffectRequireApproval || got.ReasonCode != "approval_required_money_movement" {
+		t.Fatalf("money movement must always require approval for an agent, got %q %q", got.Effect, got.ReasonCode)
+	}
+
+	del := agentReq(RiskHigh)
+	del.ActionVerb = "delete"
+	if got := e.Decide(del); got.Effect != EffectRequireApproval || got.ReasonCode != "approval_required_destructive" {
+		t.Fatalf("a HIGH delete must always require approval for an agent, got %q %q", got.Effect, got.ReasonCode)
+	}
+
+	// A MEDIUM delete (a single record) is not in the guardrail set — the
+	// tenant's delegation governs it.
+	smallDel := agentReq(RiskMedium)
+	smallDel.ActionVerb = "delete"
+	if got := e.Decide(smallDel); got.Effect != EffectAllow {
+		t.Fatalf("a MEDIUM delete under full delegation should be allowed, got %q %q", got.Effect, got.ReasonCode)
+	}
+}
+
+func TestDecide_ProtectedConfigAlwaysRequiresApprovalForAgents(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskHigh, RiskHigh, false)
+	b.System[RoleObj{Role: "sales_agent", ObjectType: "billing_config"}] = PolicyRule{Create: true, Read: true, Update: true, Delete: true}
+	e := NewEngine(func() CompiledBundle { return b })
+	r := agentReq(RiskMedium)
+	r.ObjectType = "billing_config"
+	if got := e.Decide(r); got.Effect != EffectRequireApproval || got.ReasonCode != "approval_required_protected_config" {
+		t.Fatalf("billing configuration must always require approval for an agent, got %q %q", got.Effect, got.ReasonCode)
+	}
+}
+
+func TestDecide_HumanHighFloorUnchangedByAgentDelegation(t *testing.T) {
+	b := agentBundle(AutonomyEnabled, RiskHigh, RiskHigh, false)
+	e := NewEngine(func() CompiledBundle { return b })
+	r := agentReq(RiskHigh)
+	r.Identity.ActorType = ActorUser
+	r.Identity.AgentID = ""
+	if got := e.Decide(r); got.Effect != EffectRequireApproval || got.ReasonCode != "approval_required_high_risk" {
+		t.Fatalf("a human's HIGH action still requires approval, got %q %q", got.Effect, got.ReasonCode)
+	}
+}

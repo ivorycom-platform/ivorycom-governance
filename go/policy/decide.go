@@ -324,16 +324,49 @@ func (e *Engine) outcome(
 		return res
 	}
 
-	// The HIGH floor applies to every actor type and cannot be lowered by any
-	// tenant configuration.
 	highOrd, _ := riskOrdinal(RiskHigh)
-	if riskOrd >= highOrd {
+	agent := isAgentClass(req.Identity.ActorType)
+
+	// The guardrail set. These are the actions the platform's non-negotiable
+	// guardrail #3 names — money movement, destructive deletes, and the
+	// billing/security configuration of the tenant itself — and an agent may
+	// NEVER carry one out without a human confirming it, whatever autonomy the
+	// tenant has delegated. No tenant configuration, capability grant or
+	// autonomy ceiling reaches past this block; only a verified approval
+	// (handled above) does.
+	if agent {
+		switch {
+		case req.AmountMinor > 0:
+			res.Effect = EffectRequireApproval
+			res.ReasonCode = "approval_required_money_movement"
+			return res
+		case req.ActionVerb == "delete" && riskOrd >= highOrd:
+			res.Effect = EffectRequireApproval
+			res.ReasonCode = "approval_required_destructive"
+			return res
+		case isProtectedConfig(req.ObjectType):
+			res.Effect = EffectRequireApproval
+			res.ReasonCode = "approval_required_protected_config"
+			return res
+		}
+	}
+
+	// The HIGH floor applies to every HUMAN actor and cannot be lowered by
+	// configuration. For an agent-class actor it holds too — unless the tenant
+	// has EXPLICITLY delegated HIGH: autonomy ENABLED (not merely RESTRICTED)
+	// with MaxAutoRisk at HIGH, and a capability for this exact tool whose own
+	// ceiling is HIGH and which does not itself demand approval. That is
+	// delegated autonomy in the architecture's sense (§1.24: administrators
+	// configure autonomy levels and approval requirements; §1.13: HIGH
+	// "typically requires stricter policy or approval"); the guardrail set
+	// above stays outside it.
+	if riskOrd >= highOrd && !(agent && highDelegated(profile, cap)) {
 		res.Effect = EffectRequireApproval
 		res.ReasonCode = "approval_required_high_risk"
 		return res
 	}
 
-	if isAgentClass(req.Identity.ActorType) {
+	if agent {
 		capOrd, _ := riskOrdinal(cap.MaxRisk)
 		autoOrd, _ := riskOrdinal(profile.MaxAutoRisk)
 		lowOrd, _ := riskOrdinal(RiskLow)
@@ -363,4 +396,28 @@ func (e *Engine) outcome(
 	}
 	res.Effect = EffectAllow
 	return res
+}
+
+// highDelegated reports whether a tenant has explicitly delegated HIGH-risk
+// autonomous execution of this action to the agent: autonomy ENABLED with a
+// HIGH ceiling, and a HIGH-ceiling capability that does not demand approval.
+func highDelegated(profile AutonomyProfile, cap CapabilityRule) bool {
+	if profile.Mode != AutonomyEnabled || cap.RequiresApproval {
+		return false
+	}
+	highOrd, _ := riskOrdinal(RiskHigh)
+	autoOrd, autoOK := riskOrdinal(profile.MaxAutoRisk)
+	capOrd, capOK := riskOrdinal(cap.MaxRisk)
+	return autoOK && capOK && autoOrd >= highOrd && capOrd >= highOrd
+}
+
+// isProtectedConfig names the object types guardrail #3 keeps under human
+// confirmation for agents regardless of delegation: the tenant's own billing
+// and security configuration.
+func isProtectedConfig(objectType string) bool {
+	switch objectType {
+	case "billing_config", "security_config", "billing", "security":
+		return true
+	}
+	return false
 }
