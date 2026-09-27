@@ -2,7 +2,7 @@
 
 User requirement (2026-09-27): a user request or tenant-authorized automation
 must not require another approval for ordinary work. Only money movement and
-deletion require explicit owner approval. Execution retains the requesting
+deletion require explicit OWNER or ADMIN approval. Execution retains the requesting
 principal's normal permissions. The latest instruction includes single-record
 deletion, not only bulk deletion.
 
@@ -31,10 +31,10 @@ This is NOT the full platform fix and is NOT deployed. The companion/agent
 implementation map is in ivorycom-agent at
 `docs/live-companion/requested-action-policy-map.md`.
 
-The existing CRITICAL-agent prohibition remains unchanged: owner-approved
+The existing CRITICAL-agent prohibition remains unchanged: OWNER/ADMIN-approved
 CRITICAL operations still cannot execute. Resolving it requires the trusted
-operation-effect contract and exact owner-decision binding, not a blanket removal
-of the prohibition. OWNER-only approval must be enforced by the consuming
+operation-effect contract and exact approver-decision binding, not a blanket removal
+of the prohibition. OWNER-or-ADMIN approval must be enforced by the consuming
 decision endpoints; the pure policy engine receives verified evidence and cannot
 independently prove the approver's role.
 
@@ -43,11 +43,12 @@ action definitions; a model/browser assertion is not sufficient. Recording a
 payment already received is not necessarily money movement. Dynamic integration
 actions require their actual service capability classification.
 
-The policy service currently pins an earlier governance release. Its dependency,
-vendored code, API tests and gateway action descriptors need coordinated updates.
-Chat/Builder, graph and voice also have independent local approval gates that
-must be migrated. No pending-action consumer, production config, deployment or
-tenant data was changed here.
+Policy PR #84 pins governance commit `34ce89a889f5` with vendored code and API
+tests. Agent PR #269 migrates registered built-in gates in Chat/Builder, graph
+and voice; commit `15a6a65` permits OWNER or ADMIN decisions. These draft changes
+are not production proof. Dynamic integration classification, gateway action
+descriptors and remaining independent decision consumers still need coordinated
+review. No production config, deployment or tenant data was changed here.
 
 ## Execution ledger
 
@@ -58,4 +59,4 @@ tenant data was changed here.
   before the agent-specific permission check was corrected.
 - Final `go test -count=1 ./...` and `go vet ./...` passed.
 - Inline implementation and self-review only, per the user's no-subagent rule.
-  Full deployed authorization, owner confirmation and audit evidence remain open.
+  Full deployed authorization, OWNER/ADMIN confirmation and audit evidence remain open.
