@@ -211,7 +211,9 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 	// evaluated here: it needs trusted record attributes that only the owning
 	// service holds, so it happens there, inside the mutation transaction.
 	//
-	// A VERIFIED APPROVAL satisfies this gate, and only this gate.
+	// A VERIFIED APPROVAL can satisfy this gate only for non-agent executors.
+	// An agent must retain the requesting principal's current permissions even
+	// after owner confirmation; the approver's role is never inherited.
 	//
 	// The RBAC question is "does this actor hold the right on this object?" For
 	// an approved action the actor who holds the right is the APPROVER, and the
@@ -237,7 +239,7 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 	// may not mutate tenant data. An approval relaxes WHO may carry the action
 	// out, never WHAT may be carried out.
 	rbac := e.Can(req.Identity, req.ActionVerb, req.ObjectType, req.Field)
-	if !rbac.Allow && !req.ApprovalVerified {
+	if !rbac.Allow && (agentClass || !req.ApprovalVerified) {
 		return deny(bundle.Version, ReasonResourceDenied, rbac.Reason)
 	}
 
@@ -291,13 +293,13 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 				"tenant prohibits money movement by agents")
 		}
 
-		out := e.outcome(req, riskOrd, profile, cap, rbac)
+		out := e.outcome(req, riskOrd, rbac)
 		out.LimitsRequired = profile.Limits
 		out.PolicyVersion = bundle.Version
 		return out
 	}
 
-	out := e.outcome(req, riskOrd, AutonomyProfile{}, CapabilityRule{}, rbac)
+	out := e.outcome(req, riskOrd, rbac)
 	out.PolicyVersion = bundle.Version
 	return out
 }
@@ -305,8 +307,7 @@ func (e *Engine) Decide(req DecisionRequest) DecisionResult {
 // outcome selects the allow-shape. It is reached ONLY after every denial above
 // has passed, so nothing unauthorized can become a pending approval.
 func (e *Engine) outcome(
-	req DecisionRequest, riskOrd int,
-	profile AutonomyProfile, cap CapabilityRule, rbac Decision,
+	req DecisionRequest, riskOrd int, rbac Decision,
 ) DecisionResult {
 	res := DecisionResult{
 		VisibleFields: rbac.VisibleFields,
@@ -327,67 +328,30 @@ func (e *Engine) outcome(
 	highOrd, _ := riskOrdinal(RiskHigh)
 	agent := isAgentClass(req.Identity.ActorType)
 
-	// The guardrail set. These are the actions the platform's non-negotiable
-	// guardrail #3 names — money movement, destructive deletes, and the
-	// billing/security configuration of the tenant itself — and an agent may
-	// NEVER carry one out without a human confirming it, whatever autonomy the
-	// tenant has delegated. No tenant configuration, capability grant or
-	// autonomy ceiling reaches past this block; only a verified approval
-	// (handled above) does.
+	// Confirmation is separate from authorization and risk. A granted agent
+	// operation has already passed identity, RBAC, capability, pause and limit
+	// configuration checks. Only money movement and deletion need a second
+	// decision; risk preferences must not turn ordinary work into a prompt.
+	// These values must come from the trusted action registry, not model input.
 	if agent {
 		switch {
 		case req.AmountMinor > 0:
 			res.Effect = EffectRequireApproval
 			res.ReasonCode = "approval_required_money_movement"
 			return res
-		case req.ActionVerb == "delete" && riskOrd >= highOrd:
+		case req.ActionVerb == "delete":
 			res.Effect = EffectRequireApproval
 			res.ReasonCode = "approval_required_destructive"
 			return res
-		case isProtectedConfig(req.ObjectType):
-			res.Effect = EffectRequireApproval
-			res.ReasonCode = "approval_required_protected_config"
-			return res
 		}
 	}
 
-	// The HIGH floor applies to every HUMAN actor and cannot be lowered by
-	// configuration. For an agent-class actor it holds too — unless the tenant
-	// has EXPLICITLY delegated HIGH: autonomy ENABLED (not merely RESTRICTED)
-	// with MaxAutoRisk at HIGH, and a capability for this exact tool whose own
-	// ceiling is HIGH and which does not itself demand approval. That is
-	// delegated autonomy in the architecture's sense (§1.24: administrators
-	// configure autonomy levels and approval requirements; §1.13: HIGH
-	// "typically requires stricter policy or approval"); the guardrail set
-	// above stays outside it.
-	if riskOrd >= highOrd && !(agent && highDelegated(profile, cap)) {
+	// Keep the existing direct-human policy unchanged. This correction concerns
+	// agent execution after a user/tenant grant, not unrelated human surfaces.
+	if riskOrd >= highOrd && !agent {
 		res.Effect = EffectRequireApproval
 		res.ReasonCode = "approval_required_high_risk"
 		return res
-	}
-
-	if agent {
-		capOrd, _ := riskOrdinal(cap.MaxRisk)
-		autoOrd, _ := riskOrdinal(profile.MaxAutoRisk)
-		lowOrd, _ := riskOrdinal(RiskLow)
-		switch {
-		case cap.RequiresApproval:
-			res.Effect = EffectRequireApproval
-			res.ReasonCode = "approval_required_capability"
-			return res
-		case riskOrd > capOrd:
-			res.Effect = EffectRequireApproval
-			res.ReasonCode = "approval_required_capability_max_risk"
-			return res
-		case riskOrd > autoOrd:
-			res.Effect = EffectRequireApproval
-			res.ReasonCode = "approval_required_tenant_max_auto_risk"
-			return res
-		case profile.Mode == AutonomyRestricted && riskOrd > lowOrd:
-			res.Effect = EffectRequireApproval
-			res.ReasonCode = "approval_required_autonomy_restricted"
-			return res
-		}
 	}
 
 	if len(rbac.MaskedFields) > 0 {
@@ -396,28 +360,4 @@ func (e *Engine) outcome(
 	}
 	res.Effect = EffectAllow
 	return res
-}
-
-// highDelegated reports whether a tenant has explicitly delegated HIGH-risk
-// autonomous execution of this action to the agent: autonomy ENABLED with a
-// HIGH ceiling, and a HIGH-ceiling capability that does not demand approval.
-func highDelegated(profile AutonomyProfile, cap CapabilityRule) bool {
-	if profile.Mode != AutonomyEnabled || cap.RequiresApproval {
-		return false
-	}
-	highOrd, _ := riskOrdinal(RiskHigh)
-	autoOrd, autoOK := riskOrdinal(profile.MaxAutoRisk)
-	capOrd, capOK := riskOrdinal(cap.MaxRisk)
-	return autoOK && capOK && autoOrd >= highOrd && capOrd >= highOrd
-}
-
-// isProtectedConfig names the object types guardrail #3 keeps under human
-// confirmation for agents regardless of delegation: the tenant's own billing
-// and security configuration.
-func isProtectedConfig(objectType string) bool {
-	switch objectType {
-	case "billing_config", "security_config", "billing", "security":
-		return true
-	}
-	return false
 }

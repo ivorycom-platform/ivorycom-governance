@@ -267,29 +267,27 @@ func TestDecide_AutonomyUnconfiguredDeniesAgent(t *testing.T) {
 	}
 }
 
-// TestDecide_AboveCapabilityMaxRiskRequiresApproval asserts exceeding the
-// agent's own ceiling escalates to a human rather than denying outright.
-func TestDecide_AboveCapabilityMaxRiskRequiresApproval(t *testing.T) {
+// Legacy risk preferences are not a second confirmation for a granted action.
+func TestDecide_OrdinaryActionDoesNotPromptAboveLegacyCapabilityRisk(t *testing.T) {
 	b := agentBundle(AutonomyEnabled, RiskLow, RiskMedium, false)
 	e := NewEngine(func() CompiledBundle { return b })
 
 	got := e.Decide(agentReq(RiskMedium))
 
-	if got.Effect != EffectRequireApproval {
-		t.Fatalf("above capability MaxRisk must REQUIRE_APPROVAL, got %q", got.Effect)
+	if got.Effect != EffectAllow {
+		t.Fatalf("authorized ordinary work must ALLOW, got %q", got.Effect)
 	}
 }
 
-// TestDecide_RestrictedModeEscalatesAboveLow asserts RESTRICTED forces approval
-// for anything above LOW even when capability would allow it.
-func TestDecide_RestrictedModeEscalatesAboveLow(t *testing.T) {
+// RESTRICTED is not PAUSED/DISABLED and must not prompt for granted work.
+func TestDecide_RestrictedModeDoesNotRepromptForOrdinaryAction(t *testing.T) {
 	b := agentBundle(AutonomyRestricted, RiskMedium, RiskMedium, false)
 	e := NewEngine(func() CompiledBundle { return b })
 
 	got := e.Decide(agentReq(RiskMedium))
 
-	if got.Effect != EffectRequireApproval {
-		t.Fatalf("RESTRICTED above LOW must REQUIRE_APPROVAL, got %q", got.Effect)
+	if got.Effect != EffectAllow {
+		t.Fatalf("authorized ordinary work must ALLOW, got %q", got.Effect)
 	}
 }
 
@@ -667,17 +665,12 @@ func TestDecide_ApprovalDoesNotLiftTheAbsoluteDenials(t *testing.T) {
 	}
 }
 
-// ---- delegated HIGH autonomy (2026-08-26) ---------------------------------
-//
-// The owner's product decision: a tenant may configure an agent to carry a
-// whole workflow (build, approve, publish and send a campaign; issue a quote)
-// without a human clicking through each step. The engine's HIGH floor now
-// yields to an EXPLICIT delegation — autonomy ENABLED at HIGH plus a HIGH
-// capability without a per-tool approval flag — and to nothing less. The
-// guardrail set (money movement, destructive deletes, billing/security
-// configuration) never yields.
+// ---- requested-action confirmation policy (2026-09-27) --------------------
+// Authorization is established before outcome selection. Legacy risk-based
+// confirmation preferences do not demand another click for ordinary granted
+// work. Money movement and every deletion remain confirmation categories.
 
-func TestDecide_AgentHighAutoExecutesOnlyUnderExplicitHighDelegation(t *testing.T) {
+func TestDecide_GrantedOrdinaryWorkDoesNotRepromptForLegacyRiskPreferences(t *testing.T) {
 	cases := []struct {
 		name string
 		mode AutonomyMode
@@ -687,10 +680,10 @@ func TestDecide_AgentHighAutoExecutesOnlyUnderExplicitHighDelegation(t *testing.
 		want Effect
 	}{
 		{"enabled+high cap+high ceiling → allow", AutonomyEnabled, RiskHigh, RiskHigh, false, EffectAllow},
-		{"capability demands approval → approval", AutonomyEnabled, RiskHigh, RiskHigh, true, EffectRequireApproval},
-		{"tenant ceiling MEDIUM → approval", AutonomyEnabled, RiskHigh, RiskMedium, false, EffectRequireApproval},
-		{"capability ceiling MEDIUM → approval", AutonomyEnabled, RiskMedium, RiskHigh, false, EffectRequireApproval},
-		{"RESTRICTED mode → approval", AutonomyRestricted, RiskHigh, RiskHigh, false, EffectRequireApproval},
+		{"legacy approval flag", AutonomyEnabled, RiskHigh, RiskHigh, true, EffectAllow},
+		{"legacy tenant risk preference", AutonomyEnabled, RiskHigh, RiskMedium, false, EffectAllow},
+		{"legacy capability risk preference", AutonomyEnabled, RiskMedium, RiskHigh, false, EffectAllow},
+		{"RESTRICTED mode", AutonomyRestricted, RiskHigh, RiskHigh, false, EffectAllow},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -722,23 +715,22 @@ func TestDecide_HighDelegationNeverLiftsTheGuardrailSet(t *testing.T) {
 		t.Fatalf("a HIGH delete must always require approval for an agent, got %q %q", got.Effect, got.ReasonCode)
 	}
 
-	// A MEDIUM delete (a single record) is not in the guardrail set — the
-	// tenant's delegation governs it.
+	// Every deletion requires confirmation, including a single record.
 	smallDel := agentReq(RiskMedium)
 	smallDel.ActionVerb = "delete"
-	if got := e.Decide(smallDel); got.Effect != EffectAllow {
-		t.Fatalf("a MEDIUM delete under full delegation should be allowed, got %q %q", got.Effect, got.ReasonCode)
+	if got := e.Decide(smallDel); got.Effect != EffectRequireApproval || got.ReasonCode != "approval_required_destructive" {
+		t.Fatalf("a single deletion must require approval, got %q %q", got.Effect, got.ReasonCode)
 	}
 }
 
-func TestDecide_ProtectedConfigAlwaysRequiresApprovalForAgents(t *testing.T) {
+func TestDecide_AuthorizedConfigUpdateDoesNotRequireAnotherApproval(t *testing.T) {
 	b := agentBundle(AutonomyEnabled, RiskHigh, RiskHigh, false)
 	b.System[RoleObj{Role: "sales_agent", ObjectType: "billing_config"}] = PolicyRule{Create: true, Read: true, Update: true, Delete: true}
 	e := NewEngine(func() CompiledBundle { return b })
 	r := agentReq(RiskMedium)
 	r.ObjectType = "billing_config"
-	if got := e.Decide(r); got.Effect != EffectRequireApproval || got.ReasonCode != "approval_required_protected_config" {
-		t.Fatalf("billing configuration must always require approval for an agent, got %q %q", got.Effect, got.ReasonCode)
+	if got := e.Decide(r); got.Effect != EffectAllow {
+		t.Fatalf("authorized configuration update must not prompt, got %q %q", got.Effect, got.ReasonCode)
 	}
 }
 
